@@ -14,7 +14,6 @@ use eyre::{WrapErr, eyre};
 use pgrx_pg_config::{PgConfig, PgMinorVersion, PgVersion, Pgrx, SUPPORTED_VERSIONS};
 use quote::{ToTokens, quote};
 use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{self, Path, PathBuf}; // disambiguate path::Path and syn::Type::Path
@@ -298,7 +297,7 @@ fn generate_bindings(
         .wrap_err_with(|| format!("bindgen failed for pg{major_version}"))?;
 
     let oids = extract_oids(&bindgen_output);
-    let rewritten_items = rewrite_items(bindgen_output, &oids)
+    let rewritten_items = rewrite_items(major_version, bindgen_output, &oids)
         .wrap_err_with(|| format!("failed to rewrite items for pg{major_version}"))?;
     let oids = format_builtin_oid_impl(oids);
 
@@ -405,13 +404,14 @@ fn write_rs_file(
 /// Given a token stream representing a file, apply a series of transformations to munge
 /// the bindgen generated code with some postgres specific enhancements
 fn rewrite_items(
+    major_version: u16,
     mut file: syn::File,
     oids: &BTreeMap<syn::Ident, Box<syn::Expr>>,
 ) -> eyre::Result<proc_macro2::TokenStream> {
     rewrite_c_abi_to_c_unwind(&mut file);
     let items_vec = rewrite_oid_consts(&file.items, oids);
     let mut items = apply_pg_guard(&items_vec)?;
-    let pgnode_impls = impl_pg_node(&items_vec)?;
+    let pgnode_impls = impl_pg_node(major_version, &items_vec)?;
 
     // append the pgnodes to the set of items
     items.extend(pgnode_impls);
@@ -493,72 +493,134 @@ fn format_builtin_oid_impl(oids: BTreeMap<syn::Ident, Box<syn::Expr>>) -> proc_m
 }
 
 /// Implement our `PgNode` marker trait for `pg_sys::Node` and its "subclasses"
-fn impl_pg_node(items: &[syn::Item]) -> eyre::Result<proc_macro2::TokenStream> {
-    let mut pgnode_impls = proc_macro2::TokenStream::new();
+fn impl_pg_node(major_version: u16, items: &[syn::Item]) -> eyre::Result<proc_macro2::TokenStream> {
+    let type_graph = TypeGraph::from(items);
 
-    // we scope must of the computation so we can borrow `items` and then
-    // extend it at the very end.
-    let struct_graph: StructGraph = StructGraph::from(items);
-
-    // collect all the structs with `NodeTag` as their first member,
-    // these will serve as roots in our forest of `Node`s
-    let mut root_node_structs = Vec::new();
-    for descriptor in struct_graph.descriptors.iter() {
-        // grab the first field, if any
-        let first_field = match &descriptor.struct_.fields {
-            syn::Fields::Named(fields) => {
-                if let Some(first_field) = fields.named.first() {
-                    first_field
-                } else {
-                    continue;
-                }
+    // Look through the entire file to produce a set of all variants of the Postgres `NodeTag` enum.
+    // Also look at type aliases of structs/unions, as these could be node types, too.
+    let mut node_tags: BTreeSet<String> = BTreeSet::new();
+    let mut possible_alias_tags = HashMap::new();
+    for item in items {
+        match item {
+            // the `NodeTag` enum
+            syn::Item::Enum(item_enum) if item_enum.ident == "NodeTag" => {
+                node_tags.extend(item_enum.variants.iter().map(|v| v.ident.to_string()))
             }
-            syn::Fields::Unnamed(fields) => {
-                if let Some(first_field) = fields.unnamed.first() {
-                    first_field
-                } else {
-                    continue;
-                }
+            // one type alias of a struct/union; e.g. `pub type DistinctExpr = OpExpr`
+            syn::Item::Type(item_type)
+                if let syn::Type::Path(p) = &*item_type.ty
+                    && let Some(last) = p.path.segments.last()
+                    && type_graph.name_tab.contains_key(&last.ident.to_string()) =>
+            {
+                let target_name = last.ident.to_string();
+                let alias_name = item_type.ident.to_string();
+                let tag_name = format!("T_{}", alias_name);
+                possible_alias_tags
+                    .entry(target_name)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(tag_name);
             }
             _ => continue,
-        };
-
-        // grab the type name of the first field
-        let ty_name = if let syn::Type::Path(p) = &first_field.ty
-            && let Some(last_segment) = p.path.segments.last()
-        {
-            last_segment.ident.to_string()
-        } else {
-            continue;
-        };
-
-        if ty_name == "NodeTag" {
-            root_node_structs.push(descriptor);
         }
     }
 
-    // the set of types which subclass `Node` according to postgres' object system
-    let mut node_set = BTreeSet::new();
-    // fill in any children of the roots with a recursive DFS
-    // (we are not operating on user input, so it is ok to just
-    //  use direct recursion rather than an explicit stack).
-    for root in root_node_structs.into_iter() {
-        dfs_find_nodes(root, &struct_graph, &mut node_set);
+    // Identify the root nodes of the Postgres inheritance hierarchy and recursively resolve the
+    // cast tags for them and their subclasses. The `BTreeMap` returns nodes in alphabetical order
+    // when we emit the trait implementations.
+    let mut identified_nodes = BTreeMap::new();
+    for descriptor in type_graph.descriptors.iter() {
+        let is_node = match descriptor.kind {
+            // a node struct has a `NodeTag` for its first field
+            TypeKind::Struct(struct_) => {
+                let first_field = if let syn::Fields::Named(fields) = &struct_.fields {
+                    fields.named.first()
+                } else if let syn::Fields::Unnamed(fields) = &struct_.fields {
+                    fields.unnamed.first()
+                } else {
+                    None
+                };
+
+                if let Some(first_field) = first_field
+                    && let syn::Type::Path(p) = &first_field.ty
+                    && let Some(last) = p.path.segments.last()
+                {
+                    last.ident == "NodeTag"
+                } else {
+                    false
+                }
+            }
+            // a node union has one member that is a `Node`
+            TypeKind::Union(union_) => union_.fields.named.iter().any(|field| {
+                if let syn::Type::Path(p) = &field.ty
+                    && let Some(last) = p.path.segments.last()
+                {
+                    last.ident == "Node"
+                } else {
+                    false
+                }
+            }),
+        };
+
+        if is_node {
+            resolve_pg_node_tags(
+                descriptor,
+                &type_graph,
+                &node_tags,
+                &possible_alias_tags,
+                &mut identified_nodes,
+            );
+        }
     }
 
-    // now we can finally iterate the Nodes and emit out Display impl
-    for node_struct in node_set.into_iter() {
-        let struct_name = &node_struct.struct_.ident;
+    // The `Value` struct of pg13 and pg14 is used with multiple node tags, but there's nothing in
+    // the bindgen bindings to indicate that. For these versions, directly include the tags used in
+    // the constructors defined in `nodes/value.c`.
+    if (major_version == 13 || major_version == 14)
+        && let Some(cast_tags) = identified_nodes.get_mut("Value")
+    {
+        cast_tags.extend(
+            ["T_Integer", "T_Float", "T_String", "T_BitString", "T_Null"].map(|s| s.to_string()),
+        );
+    }
 
-        // impl the PgNode trait for all nodes
-        pgnode_impls.extend(quote! {
-            impl pg_sys::seal::Sealed for #struct_name {}
-            impl pg_sys::PgNode for #struct_name {}
+    // Finally, emit `PgNode` implementations for every detected Node.
+    let mut impls = proc_macro2::TokenStream::new();
+    for (type_name, cast_tags) in identified_nodes {
+        let ident_type_name = syn::Ident::new(&type_name, proc_macro2::Span::call_site());
+        let ident_cast_tags: Vec<syn::Ident> =
+            cast_tags.iter().map(|t| syn::Ident::new(t, proc_macro2::Span::call_site())).collect();
+
+        // Seal every Node.
+        impls.extend(quote! {
+            impl pg_sys::seal::Sealed for #ident_type_name {}
         });
 
-        // impl Rust's Display trait for all nodes
-        pgnode_impls.extend(quote! {
-            impl ::core::fmt::Display for #struct_name {
+        // Implement PgNode for every Node.
+        impls.extend(match type_name.as_str() {
+            // Override the default implementation of `try_cast` for Node.
+            "Node" => quote! {
+                impl pg_sys::PgNode for #ident_type_name {
+                    const CAST_TAGS: &'static [pg_sys::NodeTag] = &[];
+
+                    #[inline]
+                    fn try_cast<T: pg_sys::PgNode>(node: &T) -> Option<&Self> {
+                        Some(node.as_node())
+                    }
+                }
+            },
+            // Use the default implementation of `try_as` with populated CAST_TAGS.
+            _ => quote! {
+                impl pg_sys::PgNode for #ident_type_name {
+                    const CAST_TAGS: &'static [pg_sys::NodeTag] = &[
+                        #(pg_sys::NodeTag::#ident_cast_tags),*
+                    ];
+                }
+            },
+        });
+
+        // Implement Display for every Node.
+        impls.extend(quote! {
+            impl ::core::fmt::Display for #ident_type_name {
                 fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                     self.display_node().fmt(f)
                 }
@@ -566,127 +628,176 @@ fn impl_pg_node(items: &[syn::Item]) -> eyre::Result<proc_macro2::TokenStream> {
         });
     }
 
-    Ok(pgnode_impls)
+    Ok(impls)
 }
 
-/// Given a root node, dfs_find_nodes adds all its children nodes to `node_set`.
-fn dfs_find_nodes<'graph>(
-    node: &'graph StructDescriptor<'graph>,
-    graph: &'graph StructGraph<'graph>,
-    node_set: &mut BTreeSet<StructDescriptor<'graph>>,
-) {
-    node_set.insert(node.clone());
-
-    for child in node.children(graph) {
-        if node_set.contains(child) {
-            continue;
-        }
-        dfs_find_nodes(child, graph, node_set);
+/// Recursively traverse a Node's subclasses and return the union of cast node tags.
+/// At the same time, collect results into `identified_nodes`.
+fn resolve_pg_node_tags<'graph>(
+    descriptor: &'graph TypeDescriptor<'graph>,
+    type_graph: &'graph TypeGraph<'graph>,
+    node_tags: &BTreeSet<String>,
+    possible_alias_tags: &HashMap<String, BTreeSet<String>>,
+    identified_nodes: &mut BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let type_name = descriptor.ident.to_string();
+    if let Some(tags) = identified_nodes.get(&type_name) {
+        return tags.clone();
     }
+
+    let mut cast_tags = BTreeSet::new();
+
+    // Start with the type name. Any Node with this tag can cast to this type.
+    let possible_tag_name = format!("T_{}", type_name);
+    if node_tags.contains(&possible_tag_name) {
+        cast_tags.insert(possible_tag_name);
+    }
+
+    // Any Node with the tag of a typedef alias can also cast to this type.
+    if let Some(possible_tags) = possible_alias_tags.get(&type_name) {
+        for possible_tag_name in possible_tags {
+            if node_tags.contains(possible_tag_name) {
+                cast_tags.insert(possible_tag_name.clone());
+            }
+        }
+    }
+
+    // Unions do not inherit their member's node tags because it is not always safe to cast in that
+    // direction. The sizeof a union member may be smaller than the union, and casting from the
+    // former to the latter leads to out-of-bounds reads and UB. The CAST_TAGS of a union should
+    // contain, at most, its own node tag and aliases.
+    if let TypeKind::Struct(_) = descriptor.kind {
+        for child in descriptor.children(type_graph) {
+            cast_tags.extend(resolve_pg_node_tags(
+                child,
+                type_graph,
+                node_tags,
+                possible_alias_tags,
+                identified_nodes,
+            ));
+        }
+    }
+
+    // Register this Node and its resolved tags in the final result set.
+    identified_nodes.insert(type_name, cast_tags.clone());
+
+    // Return this Nodes' resolved tags.
+    cast_tags
 }
 
-/// A graph describing the inheritance relationships between different nodes
+#[derive(Clone, Debug)]
+enum TypeKind<'a> {
+    Struct(&'a syn::ItemStruct),
+    Union(&'a syn::ItemUnion),
+}
+
+/// A graph describing the inheritance relationships between different types
 /// according to postgres' object system.
 ///
-/// NOTE: the borrowed lifetime on a StructGraph should also ensure that the offsets
+/// NOTE: the borrowed lifetime on a TypeGraph should also ensure that the offsets
 ///       it stores into the underlying items struct are always correct.
 #[derive(Clone, Debug)]
-struct StructGraph<'a> {
+struct TypeGraph<'a> {
     #[allow(dead_code)]
-    /// A table mapping struct names to their offset in the descriptor table
+    /// A table mapping type names to their offset in the descriptor table
     name_tab: HashMap<String, usize>,
     #[allow(dead_code)]
     /// A table mapping offsets into the underlying items table to offsets in the descriptor table
     item_offset_tab: Vec<Option<usize>>,
-    /// A table of struct descriptors
-    descriptors: Vec<StructDescriptor<'a>>,
+    /// A table of type descriptors
+    descriptors: Vec<TypeDescriptor<'a>>,
 }
 
-impl<'a> From<&'a [syn::Item]> for StructGraph<'a> {
+impl<'a> From<&'a [syn::Item]> for TypeGraph<'a> {
     fn from(items: &'a [syn::Item]) -> Self {
         let mut descriptors = Vec::new();
 
-        // a table mapping struct names to their offset in `descriptors`
+        // a table mapping type names to their offset in `descriptors`
         let mut name_tab: HashMap<String, usize> = HashMap::new();
         let mut item_offset_tab: Vec<Option<usize>> = vec![None; items.len()];
         for (i, item) in items.iter().enumerate() {
-            if let &syn::Item::Struct(struct_) = &item {
-                let next_offset = descriptors.len();
-                descriptors.push(StructDescriptor {
-                    struct_,
-                    items_offset: i,
-                    parent: None,
-                    children: Vec::new(),
-                });
-                name_tab.insert(struct_.ident.to_string(), next_offset);
-                item_offset_tab[i] = Some(next_offset);
-            }
-        }
-
-        for item in items.iter() {
-            // grab the first field if it is struct
-            let (id, first_field) = match &item {
-                syn::Item::Struct(syn::ItemStruct {
-                    ident: id,
-                    fields: syn::Fields::Named(fields),
-                    ..
-                }) => {
-                    if let Some(first_field) = fields.named.first() {
-                        (id.to_string(), first_field)
-                    } else {
-                        continue;
-                    }
-                }
-                &syn::Item::Struct(syn::ItemStruct {
-                    ident: id,
-                    fields: syn::Fields::Unnamed(fields),
-                    ..
-                }) => {
-                    if let Some(first_field) = fields.unnamed.first() {
-                        (id.to_string(), first_field)
-                    } else {
-                        continue;
-                    }
-                }
+            let (kind, ident) = match item {
+                syn::Item::Struct(struct_) => (TypeKind::Struct(struct_), struct_.ident.clone()),
+                syn::Item::Union(union_) => (TypeKind::Union(union_), union_.ident.clone()),
                 _ => continue,
             };
 
-            // We should be guaranteed that just extracting the last path
-            // segment is ok because these structs are all from the same module.
-            // (also, they are all generated from C code, so collisions should be
-            //  impossible anyway thanks to C's single shared namespace).
-            if let syn::Type::Path(p) = &first_field.ty
-                && let Some(last_segment) = p.path.segments.last()
-                && let Some(parent_offset) = name_tab.get(&last_segment.ident.to_string())
-            {
-                // establish the 2-way link
-                let child_offset = name_tab[&id];
-                descriptors[child_offset].parent = Some(*parent_offset);
-                descriptors[*parent_offset].children.push(child_offset);
+            let next_offset = descriptors.len();
+            descriptors.push(TypeDescriptor {
+                kind,
+                ident: ident.clone(),
+                items_offset: i,
+                parent: None,
+                children: Vec::new(),
+            });
+            name_tab.insert(ident.to_string(), next_offset);
+            item_offset_tab[i] = Some(next_offset);
+        }
+
+        for item in items.iter() {
+            match item {
+                // Structs represent Postgres' single-inheritance hierarchy: when the first field of
+                // a node struct is another node struct, the former "inherits" from the latter. The
+                // first field of a struct type is its parent type.
+                syn::Item::Struct(struct_) => {
+                    let first_field = if let syn::Fields::Named(fields) = &struct_.fields {
+                        fields.named.first()
+                    } else if let syn::Fields::Unnamed(fields) = &struct_.fields {
+                        fields.unnamed.first()
+                    } else {
+                        None
+                    };
+
+                    if let Some(first_field) = first_field
+                        && let syn::Type::Path(p) = &first_field.ty
+                        && let Some(last_segment) = p.path.segments.last()
+                        && let Some(parent_offset) = name_tab.get(&last_segment.ident.to_string())
+                    {
+                        let child_offset = name_tab[&struct_.ident.to_string()];
+                        descriptors[child_offset].parent = Some(*parent_offset);
+                        descriptors[*parent_offset].children.push(child_offset);
+                    }
+                }
+                // Unions represent a polymorphic container where each field is a subclass of the
+                // union. The union is the (abstract) parent type of the field types.
+                syn::Item::Union(union_) => {
+                    let union_offset = name_tab[&union_.ident.to_string()];
+                    for field in &union_.fields.named {
+                        if let syn::Type::Path(p) = &field.ty
+                            && let Some(last_segment) = p.path.segments.last()
+                            && let Some(child_offset) =
+                                name_tab.get(&last_segment.ident.to_string())
+                        {
+                            descriptors[*child_offset].parent = Some(union_offset);
+                            descriptors[union_offset].children.push(*child_offset);
+                        }
+                    }
+                }
+                _ => continue,
             }
         }
 
-        StructGraph { name_tab, item_offset_tab, descriptors }
+        TypeGraph { name_tab, item_offset_tab, descriptors }
     }
 }
 
-impl<'a> StructDescriptor<'a> {
+impl<'a> TypeDescriptor<'a> {
     /// children returns an iterator over the children of this node in the graph
-    fn children(&'a self, graph: &'a StructGraph) -> StructDescriptorChildren<'a> {
-        StructDescriptorChildren { offset: 0, descriptor: self, graph }
+    fn children(&'a self, graph: &'a TypeGraph) -> TypeDescriptorChildren<'a> {
+        TypeDescriptorChildren { offset: 0, descriptor: self, graph }
     }
 }
 
-/// An iterator over a StructDescriptor's children
-struct StructDescriptorChildren<'a> {
+/// An iterator over a TypeDescriptor's children
+struct TypeDescriptorChildren<'a> {
     offset: usize,
-    descriptor: &'a StructDescriptor<'a>,
-    graph: &'a StructGraph<'a>,
+    descriptor: &'a TypeDescriptor<'a>,
+    graph: &'a TypeGraph<'a>,
 }
 
-impl<'a> std::iter::Iterator for StructDescriptorChildren<'a> {
-    type Item = &'a StructDescriptor<'a>;
-    fn next(&mut self) -> Option<&'a StructDescriptor<'a>> {
+impl<'a> std::iter::Iterator for TypeDescriptorChildren<'a> {
+    type Item = &'a TypeDescriptor<'a>;
+    fn next(&mut self) -> Option<&'a TypeDescriptor<'a>> {
         if self.offset >= self.descriptor.children.len() {
             None
         } else {
@@ -697,32 +808,21 @@ impl<'a> std::iter::Iterator for StructDescriptorChildren<'a> {
     }
 }
 
-/// A node a StructGraph
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-struct StructDescriptor<'a> {
-    /// A reference to the underlying struct syntax node
-    struct_: &'a syn::ItemStruct,
+/// A node in a TypeGraph
+#[derive(Clone, Debug)]
+struct TypeDescriptor<'a> {
+    /// The kind of type (Struct or Union)
+    kind: TypeKind<'a>,
+    /// The identifier of the type
+    ident: syn::Ident,
+    #[allow(dead_code)]
     /// An offset into the items slice that was used to construct the struct graph that
-    /// this StructDescriptor is a part of
+    /// this TypeDescriptor is a part of
     items_offset: usize,
-    /// The offset of the "parent" (first member) struct (if any).
+    /// The offset of the "parent" struct/union (if any).
     parent: Option<usize>,
-    /// The offsets of the "children" structs (if any).
+    /// The offsets of the "children" structs/unions (if any).
     children: Vec<usize>,
-}
-
-impl PartialOrd for StructDescriptor<'_> {
-    #[inline]
-    fn partial_cmp(&self, other: &StructDescriptor) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for StructDescriptor<'_> {
-    #[inline]
-    fn cmp(&self, other: &StructDescriptor) -> Ordering {
-        self.struct_.ident.cmp(&other.struct_.ident)
-    }
 }
 
 fn get_bindings(
